@@ -13,6 +13,8 @@ export type Buffer = {
 	_instances: {Instance},
 	_instancesOffset: number,
 
+
+	Tostring: (self: Buffer) -> string,
 	Add: (self: Buffer, key: any, value: any) -> boolean,
 	Flush: (self: Buffer) -> boolean,
 	Destroy: (self: Buffer) -> (),
@@ -336,7 +338,7 @@ local NUMBER_WRITERS = {
 ]]
 local function WriteNumber(buf: Buffer, value: number)
 	local numType = ClassifyNumber(value)
-	
+
 
 	if numType < 1 or numType > 10 then
 		return false
@@ -551,11 +553,11 @@ function Buffer:Add(...): boolean
 		end
 
 		WriteU8(self, DATA_TYPES.KEY_VALUE_PAIR)
-		
+
 		local keyResult = Buffer._writeData(self, args[1])
-		
+
 		local valueResult = Buffer._writeData(self, args[2])
-	
+
 		return keyResult and valueResult
 	else
 		warn("Buffer:Add expects 1 or 2 arguments")
@@ -597,109 +599,133 @@ function Buffer:Tostring(): string
 	if not EnsureCapacity(serializationBuffer, 4) then return "" end
 	WriteU32(serializationBuffer, self._maxSize)
 
-	return Buffer._ToBase64(serializationBuffer)
+	return Buffer._ToBase85(serializationBuffer)
 end
 
-function Buffer._ToBase64(buf: Buffer): string
-	local base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+function Buffer._ToBase85(buf: Buffer): string
+	local base85Chars = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstu"
 	local result = {}
 	local resultIndex = 1
 
 	local bufferData = buf._buffer
 	local dataLength = buf._writeOffset
 
-	for i = 0, dataLength - 1, 3 do
+	for i = 0, dataLength - 1, 4 do
 		local byte1 = buffer.readu8(bufferData, i) or 0
 		local byte2 = buffer.readu8(bufferData, i + 1) or 0
 		local byte3 = buffer.readu8(bufferData, i + 2) or 0
+		local byte4 = buffer.readu8(bufferData, i + 3) or 0
 
-		local combined = bit32.lshift(byte1, 16) + bit32.lshift(byte2, 8) + byte3
+		local combined = bit32.lshift(byte1, 24) + bit32.lshift(byte2, 16) + bit32.lshift(byte3, 8) + byte4
 
-		local group1 = bit32.rshift(combined, 18) % 64
-		local group2 = bit32.rshift(combined, 12) % 64
-		local group3 = bit32.rshift(combined, 6) % 64
-		local group4 = combined % 64
+		if combined == 0 and i + 4 <= dataLength then
+			result[resultIndex] = "z"
+			resultIndex += 1
+		else
+			local digit4 = combined % 85
+			combined = math.floor(combined / 85)
+			local digit3 = combined % 85
+			combined = math.floor(combined / 85)
+			local digit2 = combined % 85
+			combined = math.floor(combined / 85)
+			local digit1 = combined % 85
+			combined = math.floor(combined / 85)
+			local digit0 = combined % 85
 
-		result[resultIndex] = string.sub(base64Chars, group1 + 1, group1 + 1)
-		result[resultIndex + 1] = string.sub(base64Chars, group2 + 1, group2 + 1)
-		result[resultIndex + 2] = string.sub(base64Chars, group3 + 1, group3 + 1)
-		result[resultIndex + 3] = string.sub(base64Chars, group4 + 1, group4 + 1)
+			result[resultIndex] = string.sub(base85Chars, digit0 + 1, digit0 + 1)
+			result[resultIndex + 1] = string.sub(base85Chars, digit1 + 1, digit1 + 1)
+			result[resultIndex + 2] = string.sub(base85Chars, digit2 + 1, digit2 + 1)
+			result[resultIndex + 3] = string.sub(base85Chars, digit3 + 1, digit3 + 1)
+			result[resultIndex + 4] = string.sub(base85Chars, digit4 + 1, digit4 + 1)
 
-		resultIndex += 4
-	end
-
-	local padding = dataLength % 3
-	if padding == 1 then
-		result[#result - 1] = "="
-		result[#result] = "="
-	elseif padding == 2 then
-		result[#result] = "="
+			resultIndex += 5
+		end
 	end
 
 	return table.concat(result)
 end
 
-function Buffer._FromBase64(base64String: string): Buffer?
-	if typeof(base64String) ~= "string" or #base64String == 0 then
+function Buffer._FromBase85(base85String: string): Buffer?
+	if typeof(base85String) ~= "string" or #base85String == 0 then
 		return nil
 	end
 
-	base64String = string.gsub(base64String, "%s", "")
+	base85String = string.gsub(base85String, "%s", "")
 
-	if not string.match(base64String, "^[A-Za-z0-9+/]*=*$") then
-		warn("Invalid Base64 string")
+	if not string.match(base85String, "^[!-u]*$") then
+		warn("Invalid Base85 string")
 		return nil
 	end
 
-	local base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local base85Chars = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstu"
 	local charToValue = {}
 
-	for i = 1, 64 do
-		charToValue[string.sub(base64Chars, i, i)] = i - 1
+	for i = 1, 85 do
+		charToValue[string.sub(base85Chars, i, i)] = i - 1
 	end
 
 	local buffer = Buffer.create({
-		size = math.ceil(#base64String * 0.75),
+		size = math.ceil(#base85String * 0.8),
 		callback = function() end
 	})
 
-	local dataLength = #base64String
-	local padding = 0
-	if string.sub(base64String, -2) == "==" then
-		padding = 2
-	elseif string.sub(base64String, -1) == "=" then
-		padding = 1
-	end
+	local dataLength = #base85String
+	local i = 1
 
-	for i = 1, dataLength - padding, 4 do
-		local char1 = string.sub(base64String, i, i)
-		local char2 = string.sub(base64String, i + 1, i + 1)
-		local char3 = string.sub(base64String, i + 2, i + 2)
-		local char4 = string.sub(base64String, i + 3, i + 3)
+	while i <= dataLength do
+		local char = string.sub(base85String, i, i)
 
-		local val1 = charToValue[char1] or 0
-		local val2 = charToValue[char2] or 0
-		local val3 = charToValue[char3] or 0
-		local val4 = charToValue[char4] or 0
+		if char == "z" then
+			if not EnsureCapacity(buffer, 4) then
+				buffer:Destroy()
+				return nil
+			end
 
-		local combined = bit32.lshift(val1, 18) + bit32.lshift(val2, 12) + bit32.lshift(val3, 6) + val4
+			WriteU8(buffer, 0)
+			WriteU8(buffer, 0)
+			WriteU8(buffer, 0)
+			WriteU8(buffer, 0)
 
-		local byte1 = bit32.rshift(combined, 16) % 256
-		local byte2 = bit32.rshift(combined, 8) % 256
-		local byte3 = combined % 256
+			i += 1
+		else
+			local chars = {}
+			for j = 0, 4 do
+				chars[j] = string.sub(base85String, i + j, i + j)
+			end
 
-		if not EnsureCapacity(buffer, 3) then
-			buffer:Destroy()
-			return nil
-		end
+			local values = {}
+			for j = 0, 4 do
+				values[j] = charToValue[chars[j]] or 0
+			end
 
-		WriteU8(buffer, byte1)
+			local combined = values[0] * 52200625 +  -- 85^4
+				values[1] * 614125 +    -- 85^3
+				values[2] * 7225 +      -- 85^2
+				values[3] * 85 +        -- 85^1
+				values[4]               -- 85^0
 
-		if i + 1 <= dataLength - padding then
-			WriteU8(buffer, byte2)
-		end
-		if i + 2 <= dataLength - padding then
-			WriteU8(buffer, byte3)
+			local byte1 = bit32.rshift(combined, 24) % 256
+			local byte2 = bit32.rshift(combined, 16) % 256
+			local byte3 = bit32.rshift(combined, 8) % 256
+			local byte4 = combined % 256
+
+			if not EnsureCapacity(buffer, 4) then
+				buffer:Destroy()
+				return nil
+			end
+
+			WriteU8(buffer, byte1)
+			if i + 1 <= dataLength then
+				WriteU8(buffer, byte2)
+			end
+			if i + 2 <= dataLength then
+				WriteU8(buffer, byte3)
+			end
+			if i + 3 <= dataLength then
+				WriteU8(buffer, byte4)
+			end
+
+			i += 5
 		end
 	end
 
@@ -711,7 +737,7 @@ function Buffer.Fromstring(encodedString: string): Buffer?
 		return nil
 	end
 
-	local serializationBuffer = Buffer._FromBase64(encodedString)
+	local serializationBuffer = Buffer._FromBase85(encodedString)
 	if not serializationBuffer then
 		return nil
 	end
@@ -737,11 +763,6 @@ function Buffer.Fromstring(encodedString: string): Buffer?
 			offset += 1
 		end
 		return bytes
-	end
-
-	local function ReadString(): string
-		local length = ReadU8()
-		return buffer.readstring(serializationBuffer._buffer, offset, length)
 	end
 
 	local version = ReadU8()
@@ -983,7 +1004,7 @@ function Buffer.Read(buf: Buffer): ({[any]: any})
 			end
 			return tbl
 		end,
-		
+
 	}
 
 	local function ReadData(): any
@@ -1005,7 +1026,7 @@ function Buffer.Read(buf: Buffer): ({[any]: any})
 				result[key] = value
 			end
 		else
-		
+
 			local reader = DATA_READERS[dataType]
 			if reader then
 				local value = reader()
