@@ -1,5 +1,5 @@
 --!optimize 2
---!strict
+--!nonstrict
 --[[
 	$$\    $$\           $$\                     $$\   $$\               
 	$$ |   $$ |          $$ |                    \__|  $$ |              
@@ -72,57 +72,37 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
 local Velocity = {}
+Velocity.__index = Velocity
 
-
--- using 1 data store for all
-
-local VELOCITY_DATA_STORE: DataStore
-do
-	local Ok, Err = pcall(function()
-		VELOCITY_DATA_STORE = DataStoreService:GetDataStore("VELOCITY_DATA_STORE")
-	end)
-	if not Ok then
-		warn(`[Velocity] DataStore Error: {Err}`)
-	end
-end
-
--- types
-export type VelocitySession = {
-	session_uuid: string,
-	is_locked: boolean,
-	data_buffer: BinBuffer.Buffer,
-	is_active: boolean,
-	key: string,
-	last_lock_time: number,
-	lock_heartbeat: boolean,
-	listeners: {},
-	
-
-	ReadKey: (key: string) -> any,
-	Read: () -> {[string]: any},
-	WriteKey: (key: string) -> (),
-	Lock: () -> (boolean),
-	Unlock: () -> (),
-	IsLocked: () -> (boolean),
-	ListenToKey: (key: string, callback: (old_value: any, new_value: any) -> ()) -> (),
-	ListenToUpdate: (callback: (key: string, old_value: any, new_value: any) -> ()) -> (),
-	Reconcile: () -> ()
+Velocity.DataStoreType = {
+	Global = 1,
+	Basic = 0
 }
 
 -- current sessions
-local Sessions: {[number]: VelocitySession} = {
-	--[player_uuid] = {
-	-- [session_uuid] = "123456789",     								   <- current session uuid
-	-- [is_locked] = true,               								   <- is locked by server
-	-- [data_buffer] = BinBuffer object, 								   <- main data buffer 
-	-- [is_active] = true,               								   <- is session active or not
-	-- [is_locked] = true,               								   <- is locked by server
-	-- [key] = "Player_123456789",       								   <- player key in data store
-	-- [last_lock_time] = 0,             								   <- time when lock was last updated
-	-- [lock_heartbeat] = false          								   <- enable auto locking
-	-- [IsLocked, Read, Lock, Unlock, ReadKey, WriteKey, Reconcile]        <- functions
-	--}
-}
+local ActiveVelocityInstances = {}
+
+-- memory store fallback system
+local MEMORY_STORE_FALLBACK_MODE = false
+local MEMORY_STORE_FALLBACK_LAST_RETRY_TIME = 0
+local LocalLocks = {} -- <- fallback for memory store
+
+local function is_memory_store_avaliable(): boolean
+	if MEMORY_STORE_FALLBACK_MODE then
+		if os.time() - MEMORY_STORE_FALLBACK_LAST_RETRY_TIME > 30 then
+			MEMORY_STORE_FALLBACK_LAST_RETRY_TIME = os.time()
+			local Ok = pcall(function()
+				SessionLocks:GetAsync("health_check")
+			end)
+			if Ok then
+				MEMORY_STORE_FALLBACK_MODE = false
+			end
+		else
+			return false
+		end
+	end
+	return true
+end
 
 -- lock managment
 local function get_lock_key(userId: number): string
@@ -136,32 +116,50 @@ local LOCK_CONFIG = {
 	HEARTBEAT_INTERVAL = 10,
 }
 
-local function acquire_lock(userId: number): boolean
+local function acquire_lock(userId: number, session_uuid: string): boolean
 	local lockKey = get_lock_key(userId)
-	local Session = Sessions[userId]
-	if not Session then
-		warn(`[Velocity] Session for player {userId} not found!`)
-		return false	
+
+	if is_memory_store_avaliable() then
+		for attempt = 1, LOCK_CONFIG.MAX_RETRIES do
+			local success, result = pcall(function()
+				return SessionLocks:SetAsync(
+					lockKey,
+					{
+						server_id = game.JobId,
+						timestamp = os.time(),
+						session_uuid = session_uuid
+					},
+					LOCK_CONFIG.TIMEOUT
+				)
+			end)
+
+			if success then
+				return true
+			else
+				if attempt == LOCK_CONFIG.MAX_RETRIES then
+					warn(`[Velocity] MemoryStore unavaliable, changing to fallback mode: {result}`)
+					MEMORY_STORE_FALLBACK_MODE = true
+					MEMORY_STORE_FALLBACK_LAST_RETRY_TIME = os.time()
+					break
+				end
+				task.wait(LOCK_CONFIG.RETRY_DELAY)
+			end
+		end
 	end
 
-	for attempt = 1, LOCK_CONFIG.MAX_RETRIES do
-		local Ok, Err = pcall(function()
-			return SessionLocks:SetAsync(
-				lockKey,
-				{
-					server_id = game.JobId,
-					timestamp = os.time(),
-					session_uuid = Session.session_uuid
-				},
-				LOCK_CONFIG.TIMEOUT
-			)
-		end)
+	if MEMORY_STORE_FALLBACK_MODE then
+		local currentLock = LocalLocks[lockKey]
 
-		if Ok then
-			return true
-		else
-			task.wait(LOCK_CONFIG.RETRY_DELAY)
+		if currentLock and os.time() - currentLock.timestamp < LOCK_CONFIG.TIMEOUT then
+			return false
 		end
+
+		LocalLocks[lockKey] = {
+			server_id = game.JobId,
+			timestamp = os.time(),
+			session_uuid = session_uuid
+		}
+		return true
 	end
 
 	return false
@@ -169,73 +167,136 @@ end
 
 local function release_lock(userId: number)
 	local lock_key = get_lock_key(userId)
-	local Ok, Err = pcall(function()
-		SessionLocks:RemoveAsync(lock_key)
-	end)
-	if not Ok then
-		warn(`[Velocity] MemoryStore Error: {Err}`)
+
+	if is_memory_store_avaliable() then
+		local Ok, Err = pcall(function()
+			SessionLocks:RemoveAsync(lock_key)
+		end)
+		if not Ok then
+			warn(`[Velocity] MemoryStore Error: {Err}`)
+			LocalLocks[lock_key] = nil
+		end
+	else
+		LocalLocks[lock_key] = nil
 	end
 end
 
+local function verify_local_lock(lock_key: string, session_uuid: string): boolean
+	local lock_data = LocalLocks[lock_key]
+	if not lock_data then
+		return false
+	end
 
-local function verify_lock_ownership(userId: number): boolean
+	if os.time() - lock_data.timestamp > LOCK_CONFIG.TIMEOUT then
+		LocalLocks[lock_key] = nil
+		return false
+	end
+
+	return if RunService:IsStudio() then true else (lock_data.server_id == game.JobId and lock_data.session_uuid == session_uuid)
+end
+
+local function verify_lock_ownership(userId: number, session_uuid: string): boolean
 	local lock_key = get_lock_key(userId)
-	local Ok, lock_data = pcall(function()
-		return SessionLocks:GetAsync(lock_key)
-	end)
 
+	if is_memory_store_avaliable() then
+		local success, lock_data = pcall(function()
+			return SessionLocks:GetAsync(lock_key)
+		end)
 
-	if Ok and lock_data then
-		return if RunService:IsStudio() then true else lock_data.server_id == game.JobId
+		if success and lock_data then
+			return if RunService:IsStudio() then true else (lock_data.server_id == game.JobId and lock_data.session_uuid == session_uuid)
+		else
+			return verify_local_lock(lock_key, session_uuid)
+		end
+	else
+		return verify_local_lock(lock_key, session_uuid)
 	end
-
-	return false
 end
 
-local function start_lock_heartbeat(Session: VelocitySession, userId: number)
-	if Session.lock_heartbeat then return end
+local function cleanup_expired_locks()
+	if MEMORY_STORE_FALLBACK_MODE then
+		local currentTime = os.time()
+		local expiredLocks = {}
 
-	Session.lock_heartbeat = true
+		for lockKey, lockData in pairs(LocalLocks) do
+			if currentTime - lockData.timestamp > LOCK_CONFIG.TIMEOUT then
+				table.insert(expiredLocks, lockKey)
+			end
+		end
+
+		for _, lockKey in ipairs(expiredLocks) do
+			LocalLocks[lockKey] = nil
+		end
+	end
+end
+
+corutine_pool:execute(function()
+	while true do
+		task.wait(60)
+		cleanup_expired_locks()
+	end
+end)
+
+local function update_local_lock(lock_key: string, session_uuid: string)
+	LocalLocks[lock_key] = {
+		server_id = game.JobId,
+		timestamp = os.time(),
+		session_uuid = session_uuid
+	}
+end
+
+local function start_lock_heartbeat(velocityInstance, userId: number, session_uuid: string)
+	if velocityInstance.lock_heartbeat then return end
+
+	velocityInstance.lock_heartbeat = true
 
 	corutine_pool:execute(function()
-		while Session.lock_heartbeat and Session.is_active and Session.is_locked do
+		while velocityInstance.lock_heartbeat and velocityInstance.is_active and velocityInstance.is_locked do
 			task.wait(LOCK_CONFIG.HEARTBEAT_INTERVAL)
 
-			if not verify_lock_ownership(userId) then
+			if not verify_lock_ownership(userId, session_uuid) then
 				warn(`[Velocity] Lock ownership lost for user {userId}`)
-				Session.is_locked = false
+				velocityInstance.is_locked = false
 				break
 			end
 
 			local lock_key = get_lock_key(userId)
-			local Ok, Err = pcall(function()
-				SessionLocks:SetAsync(
-					lock_key,
-					{
-						serverId = game.JobId,
-						timestamp = os.time(),
-						sessionId = Session.session_uuid
-					},
-					LOCK_CONFIG.TIMEOUT
-				)
-			end)
-			if not Ok then
-				warn(`[Velocity] MemoryStore Error: {Err}`)
+
+			if is_memory_store_avaliable() then
+				local Ok, Err = pcall(function()
+					SessionLocks:SetAsync(
+						lock_key,
+						{
+							serverId = game.JobId,
+							timestamp = os.time(),
+							sessionId = session_uuid
+						},
+						LOCK_CONFIG.TIMEOUT
+					)
+				end)
+				if not Ok then
+					warn(`[Velocity] MemoryStore Error: {Err}`)
+					update_local_lock(lock_key, session_uuid)
+				end
+			else
+				update_local_lock(lock_key, session_uuid)
 			end
 
-			Session.last_lock_time = os.time()
+			velocityInstance.last_lock_time = os.time()
 		end
 
-		Session.lock_heartbeat = false
+		velocityInstance.lock_heartbeat = false
 	end)
 end
 
 -- session managment
-local function wait_for_session(player: Player, timeout: number?): VelocitySession?
+
+-- blocks main thread while session loading
+local function wait_for_session(velocityInstance, player: Player, timeout: number?)
 	local startTime = os.clock()
 	timeout = timeout or 5
 
-	local session = Sessions[player.UserId]
+	local session = velocityInstance.Sessions[player.UserId]
 
 	if not session then
 		return nil
@@ -244,7 +305,7 @@ local function wait_for_session(player: Player, timeout: number?): VelocitySessi
 	while session and not session.is_active do
 		if os.clock() - startTime > timeout then
 			warn(`[Velocity] Timeout waiting for session for player {player.Name}`)
-			Velocity:RemovePlayerSession(player)
+			velocityInstance:RemovePlayerSession(player)
 			return nil
 		end
 		task.wait(0.01)
@@ -253,46 +314,54 @@ local function wait_for_session(player: Player, timeout: number?): VelocitySessi
 	return session
 end
 
-local function save_all_sessions()	
-	for user_id, session in pairs(Sessions) do
-		local Ok, Err = pcall(function()
-			VELOCITY_DATA_STORE:SetAsync(session.key, 
-				{data = session.data_buffer:Tostring()}, {user_id}
-			)
-		end)
-		if not Ok then
-			warn(`[Velocity] DataStore Error {Err}`)
-		end
+function Velocity.New(data_store_name: string, data_store_type: number, template: {[string]: any})
+	if typeof(data_store_name) ~= "string" or data_store_name:len() == 0 then
+		error(`[Velocity] DataStore name must be a string`)
 	end
+
+	local dataStore = if data_store_type == 0 then DataStoreService:GetDataStore(data_store_name) 
+		elseif data_store_type == 1 then DataStoreService:GetGlobalDataStore(data_store_name) 
+		else DataStoreService:GetDataStore(data_store_name)
+
+	local self = setmetatable({
+		_template = template,
+		_data_store = dataStore,
+		Sessions = {},
+		_data_store_name = data_store_name
+	}, Velocity)
+
+
+	ActiveVelocityInstances[data_store_name] = self
+
+	return self
 end
 
-
-function Velocity:RegisterSessionAsync(player: Player, template: {[string]: any}, key: string): VelocitySession
-	if typeof(template) ~= "table" then
-		error(`[Velocity] Template must be a table`)
-	end
+function Velocity:RegisterSessionAsync(player: Player, key: string)
 	if not player or not player:IsDescendantOf(Players) then
 		warn(`[Velocity] Player invalid, got {player}`)
 	end
-
-	local player_session: VelocitySession = Sessions[player.UserId]
 	
+	local player_session = self.Sessions[player.UserId]
+
 	if not player_session or player_session.is_active == false then
+		local session_uuid = HttpService:GenerateGUID(false)
+
 		player_session = {
-			session_uuid = HttpService:GenerateGUID(false),
+			session_uuid = session_uuid,
 			is_locked = false,
-			data_buffer = BinBuffer.create(
-				{
-					size = BinBuffer.bytes(24),
-				}
-			),
+			data_buffer = BinBuffer.create({
+				size = BinBuffer.bytes(24),
+			}),
 			is_active = false,
 			key = if key then key else `Player_{player.UserId}`,
 			lock_heartbeat = false,
 			last_lock_time = 0,
-			listeners = {}
-		} :: VelocitySession
-		Sessions[player.UserId] = player_session
+			listeners = {},
+			_template = self._template, 
+			_data_store = self._data_store, 
+			_player = player
+		}
+		self.Sessions[player.UserId] = player_session
 
 		function player_session:Read(): {}
 			if not self.is_active then
@@ -397,10 +466,10 @@ function Velocity:RegisterSessionAsync(player: Player, template: {[string]: any}
 			if self.is_locked then
 				return true
 			else
-				if acquire_lock(player.UserId) then
+				if acquire_lock(player.UserId, self.session_uuid) then
 					self.is_locked = true
 					self.last_lock_time = os.time()
-					start_lock_heartbeat(self, player.UserId)
+					start_lock_heartbeat(self, player.UserId, self.session_uuid)
 					return true
 				end
 			end
@@ -421,7 +490,8 @@ function Velocity:RegisterSessionAsync(player: Player, template: {[string]: any}
 			local current_data = BinBuffer.Read(self.data_buffer)
 
 			local missing_fields: {[string]: any} = {}
-			for key, default_value in pairs(template) do
+
+			for key, default_value in pairs(self._template) do
 				if current_data[key] == nil then
 					missing_fields[key] = default_value
 				end
@@ -445,7 +515,6 @@ function Velocity:RegisterSessionAsync(player: Player, template: {[string]: any}
 
 				self.data_buffer:Destroy()
 				self.data_buffer = new_buf
-
 			end
 		end
 
@@ -461,7 +530,7 @@ function Velocity:RegisterSessionAsync(player: Player, template: {[string]: any}
 
 		function player_session:ListenToUpdate(callback: (key: string, oldValue: any, newValue: any) -> ()): RBXScriptConnection
 			local listenerId = HttpService:GenerateGUID(false)
-			
+
 			local connection = {
 				id = listenerId,
 				callback = callback,
@@ -469,65 +538,62 @@ function Velocity:RegisterSessionAsync(player: Player, template: {[string]: any}
 
 				Disconnect = function(self)
 					self.disconnected = true
-					for i, listener in ipairs(self.listeners) do
+					for i, listener in ipairs(player_session.listeners) do
 						if listener.id == self.id then
-							table.remove(self.listeners, i)
+							table.remove(player_session.listeners, i)
 							break
 						end
 					end
 				end
 			}
 
-			table.insert(self.listeners, connection)
+			table.insert(player_session.listeners, connection)
 			return connection
 		end
 
-
 		function player_session:IsLocked(): boolean
-			return verify_lock_ownership(player.UserId)
+			return verify_lock_ownership(player.UserId, self.session_uuid)
 		end
 
 		corutine_pool:execute(function()
-			local success, error = pcall(function()
-
-				local data: {[string]: any} = VELOCITY_DATA_STORE:GetAsync(player_session.key)
+			local Ok, Err = pcall(function()
+				local data: {[string]: any} = player_session._data_store:GetAsync(player_session.key)
 
 				if data == nil then
 					player_session.data_buffer:Clear()
 
-					for key, value in pairs(template) do
+					for key, value in pairs(player_session._template) do
 						player_session.data_buffer:Add(key, value)
 					end
 
-					VELOCITY_DATA_STORE:SetAsync(
+					player_session._data_store:SetAsync(
 						player_session.key,
 						{data = player_session.data_buffer:Tostring()},
 						{player.UserId}
 					)
-
 				else
 					local buf = BinBuffer.Fromstring(data["data"]) :: BinBuffer.Buffer
-
 					player_session.data_buffer = buf
 				end
 
 				player_session.is_active = true
 			end)
-			if not success then
+			if not Ok then
 				player_session:Unlock()
-				Velocity:RemovePlayerSession(player)
+				local velocityInstance = self
+				velocityInstance:RemovePlayerSession(player)
 			end
 		end)
 
-		Sessions[player.UserId] = player_session
-		return wait_for_session(player, 5) :: VelocitySession
+		self.Sessions[player.UserId] = player_session
+		return wait_for_session(self, player, 5)
 	else
 		warn(`[Velocity] Player {player.Name} already has a session`)
-		return player_session :: VelocitySession
+		return player_session
 	end
 end
 
-function Velocity:LockSession(Session: VelocitySession): boolean
+function Velocity:LockSession(Session): boolean
 	if not Session then
 		warn(`[Velocity] Session not founded!`)
 		return false
@@ -536,7 +602,7 @@ function Velocity:LockSession(Session: VelocitySession): boolean
 	end
 end
 
-function Velocity:UnlockSession(Session: VelocitySession)
+function Velocity:UnlockSession(Session)
 	if not Session then
 		warn(`[Velocity] Session not founded!`)
 	else
@@ -545,11 +611,11 @@ function Velocity:UnlockSession(Session: VelocitySession)
 end
 
 function Velocity:RemovePlayerSession(player: Player)
-	local Session = Sessions[player.UserId]
+	local Session = self.Sessions[player.UserId]
 	if Session then
 		local Ok, Err = pcall(function()
 			if Session.is_locked then
-				VELOCITY_DATA_STORE:SetAsync(
+				self._data_store:SetAsync(
 					Session.key,
 					{data = Session.data_buffer:Tostring()},
 					{player.UserId}
@@ -563,36 +629,53 @@ function Velocity:RemovePlayerSession(player: Player)
 		Session:Unlock()
 		Session.data_buffer:Destroy()
 		Session.is_active = false
-		Sessions[player.UserId] = nil
+		self.Sessions[player.UserId] = nil
 	else
 		warn(`[Velocity] Session for player {player.Name} not founded!`)
 	end
 end
 
 function Velocity:IsSessionLocked(player: Player): boolean
-	local session = Sessions[player.UserId]
+	local session = self.Sessions[player.UserId]
 	return session and session:IsLocked() or false
 end
 
-function Velocity:GetSession(player: Player): VelocitySession
-	local player_session = Sessions[player.UserId]
+function Velocity:GetSession(player: Player)
+	local player_session = self.Sessions[player.UserId]
 
 	if player_session == nil or player_session.is_active == false then
 		error(`[Velocity] Session for player {player.Name} not founded or not active!`)
 	else
-		return player_session :: VelocitySession
+		return player_session
 	end
 end
 
 function Velocity:SaveAllSessions()
-	save_all_sessions()
+	for user_id, session in pairs(self.Sessions) do
+		local Ok, Err = pcall(function()
+			self._data_store:SetAsync(session.key, 
+				{data = session.data_buffer:Tostring()}, {user_id}
+			)
+		end)
+		if not Ok then
+			warn(`[Velocity] DataStore Error {Err}`)
+		end
+	end
 end
 
-game:BindToClose(function()
-	for _index, player in pairs(Players:GetPlayers()) do
-		corutine_pool:execute(function()
-			Velocity:RemovePlayerSession(player)
-		end)
-	end
-end)
+if not game:GetService("RunService"):IsStudio() then
+	game:BindToClose(function()
+		for dataStoreName, velocityInstance in pairs(ActiveVelocityInstances) do
+			for userId, session in pairs(velocityInstance.Sessions) do
+				corutine_pool:execute(function()
+					local player = Players:GetPlayerByUserId(userId)
+					if player then
+						velocityInstance:RemovePlayerSession(player)
+					end
+				end)
+			end
+		end
+	end)
+end
+
 return Velocity
